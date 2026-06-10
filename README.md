@@ -91,8 +91,9 @@ NMM deployment (App Service B2 + Azure SQL Standard/S1 both available):
 ## How it works
 
 - **App Service gate:** `az appservice list-locations --sku B2` — regions that *offer* the SKU (Windows workers; no `--linux-workers-enabled` flag).
-- **SQL gate:** `az sql db list-editions -l <region> --edition Standard --service-objective S1 --available` — the `--available` flag is the key: it returns empty when the SKU exists in the catalog but **isn't deployable** in that subscription/region.
+- **SQL gate:** the `Microsoft.Sql/locations/<region>/capabilities` REST API. It reports whether the Standard/S1 objective is offered **and** returns the human-readable **reason** when a region is blocked (e.g. *"Provisioning is restricted in this region… open a support request with Issue type of 'Service and subscription limits'"*). Those reasons are shown in a **"Why these regions were excluded"** section so you can explain the block to the partner.
 - Cross-references the two and reports only regions that pass **both**.
+- **Speed:** on PowerShell 7+ (Azure Cloud Shell) the per-region SQL calls run in parallel (`-ThrottleLimit 15`); Windows PowerShell 5.1 runs them sequentially.
 
 ### ⚠️ Availability ≠ quota — what this does and doesn't prove
 

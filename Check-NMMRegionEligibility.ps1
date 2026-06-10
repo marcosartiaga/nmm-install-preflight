@@ -67,6 +67,11 @@
 .NOTES
     Run in Azure Cloud Shell (PowerShell mode) -- already authenticated -- or in local
     PowerShell with Azure CLI installed and `az login` completed.
+
+    SQL availability comes from the Microsoft.Sql locations/capabilities REST API, which
+    also returns the human-readable REASON a region is blocked (e.g. provisioning
+    restricted -> open a quota support request). On PowerShell 7+ (Cloud Shell) the
+    per-region SQL checks run in parallel; Windows PowerShell 5.1 runs them sequentially.
 #>
 
 [CmdletBinding()]
@@ -93,6 +98,50 @@ function Write-Banner {
     Write-Host ('=' * 72) -ForegroundColor DarkCyan
 }
 
+function Get-SqlRegionStatus {
+    # Queries the Microsoft.Sql capabilities API for one region and returns whether the
+    # requested edition/SLO can be provisioned -- plus the human-readable REASON when it
+    # can't (e.g. "Provisioning is restricted in this region..."). Pure/self-contained so
+    # it can be reused inside ForEach-Object -Parallel. Returns: Region, Ok, Reason.
+    param(
+        [string]$Region, [string]$Sub, [string]$Token,
+        [string]$Edition, [string]$Slo, [string]$ApiVersion
+    )
+    $uri = "https://management.azure.com/subscriptions/$Sub/providers/Microsoft.Sql/locations/$Region/capabilities?api-version=$ApiVersion&include=supportedEditions"
+    try {
+        $resp = Invoke-RestMethod -Method GET -Uri $uri -Headers @{ Authorization = "Bearer $Token" } -ErrorAction Stop
+
+        # A populated reason means provisioning is restricted/blocked for this subscription.
+        $reason = $resp.supportedServerVersions.reason | Where-Object { $_ } | Select-Object -First 1
+        if ($reason) { $reason = ($reason -replace '\s+', ' ').Trim() }
+
+        # Is the requested edition + service objective actually offered here?
+        $sloListed = $false
+        foreach ($sv in $resp.supportedServerVersions) {
+            foreach ($e in $sv.supportedEditions) {
+                if ($e.name -eq $Edition) {
+                    foreach ($o in $e.supportedServiceLevelObjectives) {
+                        if ($o.name -eq $Slo) { $sloListed = $true }
+                    }
+                }
+            }
+        }
+
+        if ($reason) {
+            return [pscustomobject]@{ Region = $Region; Ok = $false; Reason = $reason }
+        }
+        elseif ($sloListed) {
+            return [pscustomobject]@{ Region = $Region; Ok = $true;  Reason = '' }
+        }
+        else {
+            return [pscustomobject]@{ Region = $Region; Ok = $false; Reason = "$Edition/$Slo is not offered in this region" }
+        }
+    }
+    catch {
+        return [pscustomobject]@{ Region = $Region; Ok = $false; Reason = "SQL capabilities API error: $($_.Exception.Message)" }
+    }
+}
+
 # --- 0. Pre-flight: az present + authenticated -----------------------------
 if (-not (Get-Command az -ErrorAction SilentlyContinue)) {
     throw "Azure CLI ('az') not found. Run this in Azure Cloud Shell, or install the Azure CLI locally."
@@ -105,6 +154,13 @@ if ($SubscriptionId) {
 $ctx = az account show --only-show-errors 2>$null | ConvertFrom-Json
 if (-not $ctx) {
     throw "Not logged in to Azure. Run 'az login' (not needed in Cloud Shell) and try again."
+}
+$subId = $ctx.id
+
+# ARM bearer token for the SQL capabilities REST API (gives the per-region "reason").
+$token = az account get-access-token --query accessToken -o tsv 2>$null
+if (-not $token) {
+    throw "Could not acquire an Azure access token ('az account get-access-token' failed)."
 }
 
 Write-Banner "Nerdio Manager for MSP (NMM) - Region Eligibility Check"
@@ -237,51 +293,64 @@ if (-not $candidates -or @($candidates).Count -eq 0) {
     return
 }
 
-# --- 4. Evaluate each candidate (SQL Standard/S1 availability) --------------
+# --- 4. Evaluate SQL availability per candidate (capabilities API) ----------
+# PowerShell 7+ (Azure Cloud Shell) runs the per-region calls in parallel; Windows
+# PowerShell 5.1 falls back to a sequential loop with a progress bar.
+$apiVersion  = '2023-05-01-preview'
+$candidates  = @($candidates)
+$useParallel = ($PSVersionTable.PSVersion.Major -ge 7) -and ($candidates.Count -gt 3)
+
+if ($useParallel) {
+    Write-Host ("  (running {0} SQL checks in parallel)" -f $candidates.Count) -ForegroundColor DarkGray
+    $funcDef = ${function:Get-SqlRegionStatus}.ToString()
+    $sqlResults = $candidates | ForEach-Object -Parallel {
+        ${function:Get-SqlRegionStatus} = $using:funcDef
+        Get-SqlRegionStatus -Region $_ -Sub $using:subId -Token $using:token `
+            -Edition $using:SqlEdition -Slo $using:SqlServiceObjective -ApiVersion $using:apiVersion
+    } -ThrottleLimit 15
+}
+else {
+    $sqlResults = New-Object System.Collections.Generic.List[object]
+    $i = 0
+    foreach ($slug in $candidates) {
+        $i++
+        Write-Progress -Activity "Checking SQL availability" -Status $slug -PercentComplete ([int](($i / $candidates.Count) * 100))
+        $sqlResults.Add( (Get-SqlRegionStatus -Region $slug -Sub $subId -Token $token `
+            -Edition $SqlEdition -Slo $SqlServiceObjective -ApiVersion $apiVersion) )
+    }
+    Write-Progress -Activity "Checking SQL availability" -Completed
+}
+
+# Index SQL results by region, then merge with App Service availability.
+$sqlByRegion = @{}
+foreach ($s in $sqlResults) { $sqlByRegion[$s.Region] = $s }
+
 $results = New-Object System.Collections.Generic.List[object]
-$i = 0
 foreach ($slug in $candidates) {
-    $i++
-    Write-Progress -Activity "Checking SQL availability" -Status $slug -PercentComplete ([int](($i / $candidates.Count) * 100))
-
-    $appOk = $appSvcSlugs.Contains($slug)
-
-    # SQL: --available filters to what is actually deployable in this region for this subscription.
-    $sqlOk = $false
-    try {
-        $editions = az sql db list-editions -l $slug `
-                        --edition $SqlEdition `
-                        --service-objective $SqlServiceObjective `
-                        --available -o json --only-show-errors 2>$null | ConvertFrom-Json
-        if ($editions) {
-            $slo = $editions | ForEach-Object { $_.supportedServiceLevelObjectives } |
-                   Where-Object { $_.name -eq $SqlServiceObjective }
-            $sqlOk = [bool]$slo
-        }
-    }
-    catch {
-        # An invalid region slug or an unsupported location throws; treat as "not available".
-        $sqlOk = $false
-    }
-
-    $display = if ($slugToName.ContainsKey($slug)) { $slugToName[$slug] } else { $slug }
+    $appOk     = $appSvcSlugs.Contains($slug)
+    $sql       = $sqlByRegion[$slug]
+    $sqlOk     = [bool]($sql -and $sql.Ok)
+    $sqlReason = if ($sql) { $sql.Reason } else { 'no SQL result returned' }
+    $display   = if ($slugToName.ContainsKey($slug)) { $slugToName[$slug] } else { $slug }
 
     $results.Add([pscustomobject]@{
-        Region      = $slug
-        DisplayName = $display
-        AppService  = if ($appOk) { 'Yes' } else { 'No' }
-        SqlDb       = if ($sqlOk) { 'Yes' } else { 'No' }
-        Eligible    = if ($appOk -and $sqlOk) { 'YES' } else { 'no' }
+        Region           = $slug
+        DisplayName      = $display
+        AppService       = if ($appOk) { 'Yes' } else { 'No' }
+        SqlDb            = if ($sqlOk) { 'Yes' } else { 'No' }
+        Eligible         = if ($appOk -and $sqlOk) { 'YES' } else { 'no' }
+        SqlReason        = if ($sqlOk) { '' } else { $sqlReason }
+        AppServiceReason = if ($appOk) { '' } else { "App Service $AppServiceSku not offered in this region" }
     })
 }
-Write-Progress -Activity "Checking SQL availability" -Completed
 
 # --- 5. Output --------------------------------------------------------------
 $sorted   = $results | Sort-Object @{E={$_.Eligible -eq 'YES'};Descending=$true}, DisplayName
-$eligible = $sorted | Where-Object { $_.Eligible -eq 'YES' }
+# @() forces array context -- a single Where-Object result is a scalar whose .Count is $null.
+$eligible = @($sorted | Where-Object { $_.Eligible -eq 'YES' })
 
 Write-Banner "Results"
-$sorted | Format-Table -AutoSize
+$sorted | Format-Table Region, DisplayName, AppService, SqlDb, Eligible -AutoSize
 
 Write-Banner "RECOMMENDATION"
 if ($eligible.Count -gt 0) {
@@ -292,15 +361,27 @@ if ($eligible.Count -gt 0) {
 }
 else {
     Write-Host "No checked region offers BOTH App Service $AppServiceSku and SQL $SqlEdition/$SqlServiceObjective." -ForegroundColor Yellow
-    Write-Host "Widen the search (drop -Regions to scan all regions) or consider a different App Service SKU / SQL tier." -ForegroundColor Yellow
+    Write-Host "Widen the search (try -Geography All) or consider a different App Service SKU / SQL tier." -ForegroundColor Yellow
+}
+
+# Explain the excluded regions (the SQL reason is the partner-facing "why").
+$excluded = @($sorted | Where-Object { $_.Eligible -ne 'YES' })
+if ($excluded.Count -gt 0) {
+    Write-Banner "Why these regions were excluded"
+    foreach ($x in $excluded) {
+        Write-Host ("  {0} ({1})" -f $x.DisplayName, $x.Region) -ForegroundColor Yellow
+        if ($x.AppService -eq 'No') { Write-Host ("      App Service : {0}" -f $x.AppServiceReason) -ForegroundColor DarkGray }
+        if ($x.SqlDb -eq 'No')      { Write-Host ("      SQL         : {0}" -f $x.SqlReason)        -ForegroundColor DarkGray }
+    }
 }
 
 Write-Host ''
-Write-Host "AVAILABILITY, NOT QUOTA: 'Eligible' means both SKUs are AVAILABLE to this subscription in" -ForegroundColor DarkGray
-Write-Host "the region -- it is NOT a guarantee of quota headroom. Live quota for App Service and Azure" -ForegroundColor DarkGray
-Write-Host "SQL can't be pre-checked via any public API; it's enforced at deploy time. If a deploy fails" -ForegroundColor DarkGray
-Write-Host "on a quota/capacity error in an Eligible region, pick another Eligible region or open an Azure" -ForegroundColor DarkGray
-Write-Host "support request (issue type: 'Service and subscription limits (quotas)') for that region." -ForegroundColor DarkGray
+Write-Host "AVAILABILITY, NOT QUOTA: 'Eligible' means both SKUs are AVAILABLE to provision in the region." -ForegroundColor DarkGray
+Write-Host "For SQL, blocked regions show the reason above (usually a subscription/region provisioning" -ForegroundColor DarkGray
+Write-Host "restriction -- lifted via a quota support request). App Service capacity has NO public pre-check" -ForegroundColor DarkGray
+Write-Host "API, so it can still fail at deploy time even in an Eligible region. Either way: if a deploy fails" -ForegroundColor DarkGray
+Write-Host "on quota/capacity, pick another Eligible region or open an Azure support request (issue type:" -ForegroundColor DarkGray
+Write-Host "'Service and subscription limits (quotas)') for that region." -ForegroundColor DarkGray
 
 # --- 6. Optional CSV --------------------------------------------------------
 if ($OutFile) {
