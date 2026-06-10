@@ -22,13 +22,13 @@ The SQL availability check (`--available`) and App Service quota are **per-subsc
 Open Cloud Shell at <https://shell.azure.com> (or the `>_` icon in the Azure portal), make sure it's in **PowerShell** mode, and paste:
 
 ```powershell
-irm https://raw.githubusercontent.com/OWNER/nmm-install-preflight/main/Check-NMMRegionEligibility.ps1 -OutFile nmm.ps1; ./nmm.ps1 -Regions eastus,eastus2,centralus,westus2,westus3
+irm https://raw.githubusercontent.com/marcosartiaga/nmm-install-preflight/main/Check-NMMRegionEligibility.ps1 -OutFile nmm.ps1; ./nmm.ps1 -Regions eastus,eastus2,centralus,westus2,westus3
 ```
 
 That downloads the latest script and checks the listed regions. Drop `-Regions` to scan **every** region that offers the App Service SKU (takes ~1 minute):
 
 ```powershell
-irm https://raw.githubusercontent.com/OWNER/nmm-install-preflight/main/Check-NMMRegionEligibility.ps1 -OutFile nmm.ps1; ./nmm.ps1
+irm https://raw.githubusercontent.com/marcosartiaga/nmm-install-preflight/main/Check-NMMRegionEligibility.ps1 -OutFile nmm.ps1; ./nmm.ps1
 ```
 
 > First-time Cloud Shell users get a one-time "set up storage" prompt (~30s) — or just pick the ephemeral/no-storage session. Either works.
