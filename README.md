@@ -22,13 +22,32 @@ The SQL availability check (`--available`) and App Service quota are **per-subsc
 Open Cloud Shell at <https://shell.azure.com> (or the `>_` icon in the Azure portal), make sure it's in **PowerShell** mode, and paste:
 
 ```powershell
-irm https://raw.githubusercontent.com/marcosartiaga/nmm-install-preflight/main/Check-NMMRegionEligibility.ps1 -OutFile nmm.ps1; ./nmm.ps1 -Regions eastus,eastus2,centralus,westus2,westus3
+irm https://raw.githubusercontent.com/marcosartiaga/nmm-install-preflight/main/Check-NMMRegionEligibility.ps1 -OutFile nmm.ps1; ./nmm.ps1
 ```
 
-That downloads the latest script and checks the listed regions. Drop `-Regions` to scan **every** region that offers the App Service SKU (takes ~1 minute):
+With no arguments it **asks where the partner is located** and checks just that geography — so you don't need to know region slugs:
+
+```
+Where is the partner / MSP located? (filters which regions to check)
+   1. United States
+   2. Canada
+   3. North America (US + Canada + Mexico)
+   4. Europe (incl. UK)
+   5. United Kingdom
+   6. Asia Pacific
+   ...
+  10. All regions
+Enter choice [1]:
+```
+
+Already know the answer? Skip the prompt:
 
 ```powershell
-irm https://raw.githubusercontent.com/marcosartiaga/nmm-install-preflight/main/Check-NMMRegionEligibility.ps1 -OutFile nmm.ps1; ./nmm.ps1
+# Just the US:
+irm https://raw.githubusercontent.com/marcosartiaga/nmm-install-preflight/main/Check-NMMRegionEligibility.ps1 -OutFile nmm.ps1; ./nmm.ps1 -Geography US
+
+# Or specific regions the partner named:
+irm https://raw.githubusercontent.com/marcosartiaga/nmm-install-preflight/main/Check-NMMRegionEligibility.ps1 -OutFile nmm.ps1; ./nmm.ps1 -Regions eastus,centralus,westus2
 ```
 
 > First-time Cloud Shell users get a one-time "set up storage" prompt (~30s) — or just pick the ephemeral/no-storage session. Either works.
@@ -59,7 +78,8 @@ NMM deployment (App Service B2 + Azure SQL Standard/S1 both available):
 
 | Parameter | Default | Notes |
 |---|---|---|
-| `-Regions` | *(all B2 regions)* | Comma-separated region slugs (e.g. `eastus,westus2`). Requested regions are checked for **both** gates, so you can answer "why *not* the region the partner asked for?" |
+| `-Geography` | *(prompts)* | Limit to a geography without knowing slugs: `US`, `Canada`, `NorthAmerica`, `Europe`, `UK`, `AsiaPacific`, `MiddleEast`, `Africa`, `SouthAmerica`, `Mexico`, `All`. If omitted (and no `-Regions`), the script prompts interactively. |
+| `-Regions` | *(geography/all)* | Comma-separated region slugs (e.g. `eastus,westus2`). Overrides `-Geography`. Named regions are checked for **both** gates, so you can answer "why *not* the region the partner asked for?" |
 | `-AppServiceSku` | `B2` | NMM default (Basic Medium, Windows). |
 | `-SqlEdition` | `Standard` | NMM default SQL tier. |
 | `-SqlServiceObjective` | `S1` | NMM default performance level (20 DTU). |
@@ -74,8 +94,19 @@ NMM deployment (App Service B2 + Azure SQL Standard/S1 both available):
 - **SQL gate:** `az sql db list-editions -l <region> --edition Standard --service-objective S1 --available` — the `--available` flag is the key: it returns empty when the SKU exists in the catalog but **isn't deployable** in that subscription/region.
 - Cross-references the two and reports only regions that pass **both**.
 
-### Important caveat (App Service capacity)
-`az appservice list-locations` reports where the SKU is **offered**, not live capacity. The *"No availability of Basic VM SKU app service quota"* error can still occasionally hit an offered region under capacity pressure — there's no public API to pre-check live App Service capacity. If a deploy fails in an "Eligible" region, switch to another eligible region or open an Azure support request to raise the App Service quota there.
+### ⚠️ Availability ≠ quota — what this does and doesn't prove
+
+This tool tells you whether each SKU is **available / offered** to the subscription in a region. It does **not** confirm the subscription has the **quota headroom** to actually provision it:
+
+- The Azure Quota API (`Microsoft.Quota`) only covers Compute, Azure ML, Networking, HPC Cache, Storage, and Purview — **not** App Service (`Microsoft.Web`) and **not** Azure SQL. So live quota for these two resources **cannot be pre-checked by any public API**.
+- Quota is only enforced at **deploy time**, and raised via a support request.
+
+So **"Eligible" means "both SKUs are available in the region," not "guaranteed to deploy."** If a deploy fails on a quota/capacity error (e.g. *"No availability of Basic VM SKU app service quota"*) in an Eligible region:
+
+1. Pick another **Eligible** region from the list, **or**
+2. Open an Azure support request — issue type **"Service and subscription limits (quotas)"** — for that region.
+
+The only way to *prove* a region will take the deploy is to attempt it (or a validation deployment). This tool removes the regions that will definitely fail, which is most of the value on a live call.
 
 ---
 
