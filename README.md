@@ -2,13 +2,14 @@
 
 Pre-install readiness checks for deploying **Nerdio Manager for MSP (NMM)** from the Azure Marketplace.
 
-NMM's marketplace deployment can silently fail late in the wizard when the subscription isn't set up correctly. `Check-NMMRegionEligibility.ps1` runs three phases in one pass to catch the most common blockers before the partner starts the install:
+NMM's marketplace deployment can silently fail late in the wizard when the subscription isn't set up correctly. `Check-NMMRegionEligibility.ps1` runs through these phases in one pass to catch the most common blockers before the partner starts the install — and can optionally file the Azure support tickets needed to clear them:
 
 | Phase | What it checks |
 |---|---|
 | **0 — Permissions** | The signed-in account holds Subscription **Owner** *and* Entra ID **Global Administrator**. Missing either will fail the install. Reports PASS / FAIL per check. |
 | **1 — Resource providers** | All 14 providers NMM requires are **Registered**. Pass `-RegisterProviders` to register any that aren't and poll until they finish. |
 | **2 — Region eligibility** | Which regions offer **both** core resources NMM needs (below) — so you can de-risk region choice live on a partner call. |
+| **3 — Support tickets** *(optional)* | Pass `-OpenTicket` to file Azure quota support tickets for SQL regions flagged as provisioning-restricted in Phase 2 — one per region, without leaving the call. Requires a paid Azure support plan. |
 
 The two recurring region offenders:
 
@@ -62,6 +63,12 @@ irm https://raw.githubusercontent.com/marcosartiaga/nmm-install-preflight/main/C
 irm https://raw.githubusercontent.com/marcosartiaga/nmm-install-preflight/main/Check-NMMRegionEligibility.ps1 -OutFile nmm.ps1; ./nmm.ps1 -Regions eastus,centralus,westus2
 ```
 
+To also **file Azure support tickets** for SQL provisioning-restricted regions (Phase 3 — needs a paid Azure support plan), add `-OpenTicket`:
+
+```powershell
+irm https://raw.githubusercontent.com/marcosartiaga/nmm-install-preflight/main/Check-NMMRegionEligibility.ps1 -OutFile nmm.ps1; ./nmm.ps1 -OpenTicket
+```
+
 > First-time Cloud Shell users get a one-time "set up storage" prompt (~30s) — or just pick the ephemeral/no-storage session. Either works.
 
 ---
@@ -100,8 +107,9 @@ RECOMMENDATION
 
 | Parameter | Default | Notes |
 |---|---|---|
-| `-RegisterProviders` | *(off)* | Register any unregistered providers in Phase 1 and poll until complete. **This is the only switch that changes anything** — without it the script is read-only. |
+| `-RegisterProviders` | *(off)* | Register any unregistered providers in Phase 1 and poll until complete. Phases 0–2 are read-only; this and `-OpenTicket` are the only switches that change anything. |
 | `-ProviderTimeoutMinutes` | `15` | How long Phase 1 waits for registration to finish. |
+| `-OpenTicket` | *(off)* | Phase 3: prompt to file Azure support tickets for SQL provisioning-restricted regions. Requires a paid Azure support plan (Developer+). Enter the partner's time zone as a **Windows** name (e.g. `Eastern Standard Time`), not IANA. |
 | `-Geography` | *(prompts)* | Limit Phase 2 to a geography without knowing slugs: `US`, `Canada`, `NorthAmerica`, `Europe`, `UK`, `AsiaPacific`, `MiddleEast`, `Africa`, `SouthAmerica`, `Mexico`, `All`. If omitted (and no `-Regions`), the script prompts interactively. |
 | `-Regions` | *(geography/all)* | Comma-separated region slugs (e.g. `eastus,westus2`). Overrides `-Geography`. Named regions are checked for **both** gates, so you can answer "why *not* the region the partner asked for?" |
 | `-AppServiceSku` | `B2` | NMM default (Basic Medium, Windows). |
@@ -119,6 +127,7 @@ RECOMMENDATION
 - **Phase 2 — App Service gate:** `az appservice list-locations --sku B2` — regions that *offer* the SKU (Windows workers).
 - **Phase 2 — SQL gate:** the `Microsoft.Sql/locations/<region>/capabilities` REST API. It reports whether the Standard/S1 objective is offered **and** returns the human-readable **reason** when a region is blocked (e.g. *"Provisioning is restricted in this region… open a support request with Issue type of 'Service and subscription limits'"*). Those reasons are shown in a **"Why these regions were excluded"** section so you can explain the block to the partner.
 - **Speed:** on PowerShell 7+ (Azure Cloud Shell) the per-region SQL calls run in parallel (`-ThrottleLimit 15`); Windows PowerShell 5.1 runs them sequentially.
+- **Phase 3 — Support tickets (`-OpenTicket`):** for each SQL region Phase 2 flags as provisioning-restricted, the script resolves the Azure support service + problem classification dynamically (no hardcoded GUIDs), collects partner contact details once, and files a quota ticket via the Azure Support REST API (`PUT` → 202 async → poll → `GET` to confirm). Requires a paid support plan (Developer+); on a Free plan Azure rejects creation and the script falls back to the manual Portal path. Enter the time zone as a **Windows** name (Microsoft Time Zone Index Values, e.g. `Pacific Standard Time`) — IANA names are rejected by the create API.
 
 ### ⚠️ Availability ≠ quota — what Phase 2 does and doesn't prove
 
@@ -137,4 +146,4 @@ So **"Eligible" means "both SKUs are available in the region," not "guaranteed t
 ## Requirements
 
 - Azure Cloud Shell (PowerShell mode) — already authenticated — **or** local PowerShell 5.1+ with the [Azure CLI](https://learn.microsoft.com/cli/azure/install-azure-cli) installed and `az login` completed.
-- The script is **read-only by default**. The only switch that changes anything is `-RegisterProviders`, which registers resource providers (and requires Owner/Contributor on the subscription).
+- The script is **read-only by default**. Two switches make changes: `-RegisterProviders` registers resource providers (requires Owner/Contributor on the subscription), and `-OpenTicket` files Azure support tickets (requires a paid support plan).
